@@ -1,0 +1,534 @@
+name: Treehammock Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to create. Use vMAJOR.MINOR.PATCH, for example v1.0.0.
+        required: true
+        default: v1.0.0
+        type: string
+      target_ref:
+        description: Branch, tag, or SHA to release when manually dispatched.
+        required: true
+        default: main
+        type: string
+      create_release:
+        description: Create or update the GitHub Release after all gates pass.
+        required: true
+        default: true
+        type: boolean
+      publish_ghcr:
+        description: Publish the Docker api image to GitHub Container Registry.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: treehammock-release-${{ github.workflow }}-${{ github.ref }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+  BUILD_CONFIGURATION: Release
+  RELEASE_PACKAGE_NAME: treehammock-api
+  PUSH_LATEST_FOR_STABLE: "true"
+
+jobs:
+  release-preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release_tag: ${{ steps.release-meta.outputs.release_tag }}
+      release_version: ${{ steps.release-meta.outputs.release_version }}
+      release_base_version: ${{ steps.release-meta.outputs.release_base_version }}
+      release_assembly_version: ${{ steps.release-meta.outputs.release_assembly_version }}
+      release_archive: ${{ steps.release-meta.outputs.release_archive }}
+      release_checksum: ${{ steps.release-meta.outputs.release_checksum }}
+      checkout_ref: ${{ steps.release-meta.outputs.checkout_ref }}
+      is_prerelease: ${{ steps.release-meta.outputs.is_prerelease }}
+      release_mode: ${{ steps.release-meta.outputs.release_mode }}
+      should_release: ${{ steps.release-meta.outputs.should_release }}
+      skip_reason: ${{ steps.release-meta.outputs.skip_reason }}
+    steps:
+      - name: Check out main release history
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: release-meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags --prune origin +refs/heads/main:refs/remotes/origin/main
+          main_ref="refs/remotes/origin/main"
+          initial_main_commit="$(git rev-list --first-parent --max-parents=0 "${main_ref}" | tail -n 1)"
+          current_main_commit="$(git rev-parse "${main_ref}")"
+          trigger_commit="${GITHUB_SHA}"
+          checkout_ref="${initial_main_commit}"
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            release_tag="v1.0.0"
+            release_mode="bootstrap"
+          else
+            release_tag="${{ github.event.inputs.release_tag }}"
+            requested_ref="$(git rev-parse "${{ github.event.inputs.target_ref }}^{commit}")"
+            release_mode="manual"
+          fi
+
+          if ! printf '%s' "$release_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'; then
+            echo "Release tag must look like vMAJOR.MINOR.PATCH, optionally with a suffix: ${release_tag}" >&2
+            exit 2
+          fi
+
+          release_version="${release_tag#v}"
+          release_base_version="${release_version%%[-+]*}"
+          if ! printf '%s' "$release_base_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release base version must contain exactly major.minor.patch: ${release_base_version}" >&2
+            exit 2
+          fi
+
+          release_assembly_version="${release_base_version}.0"
+          if printf '%s' "$release_version" | grep -q -- '-'; then
+            is_prerelease="true"
+          else
+            is_prerelease="false"
+          fi
+
+          release_archive="${RELEASE_PACKAGE_NAME}-${release_tag}.tar.gz"
+          release_checksum="${RELEASE_PACKAGE_NAME}-${release_tag}.sha256"
+
+          should_release="true"
+          skip_reason=""
+          if [ "${release_tag}" != "v1.0.0" ]; then
+            should_release="false"
+            skip_reason="Release workflow is pinned to v1.0.0 only."
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            should_release="false"
+            skip_reason="Release v1.0.0 only runs from pushes to main."
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${trigger_commit}" != "${initial_main_commit}" ]; then
+            should_release="false"
+            skip_reason="Release v1.0.0 only runs from the initial commit to main (${initial_main_commit}); trigger commit was ${trigger_commit}."
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "${requested_ref}" != "${initial_main_commit}" ]; then
+            should_release="false"
+            skip_reason="Manual v1.0.0 release must target the initial commit to main (${initial_main_commit}); requested target resolved to ${requested_ref}."
+          elif gh release view "${release_tag}" >/dev/null 2>&1; then
+            should_release="false"
+            skip_reason="GitHub Release ${release_tag} already exists."
+          elif gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}" >/dev/null 2>&1; then
+            should_release="false"
+            skip_reason="Git tag ${release_tag} already exists."
+          fi
+
+          {
+            echo "release_tag=${release_tag}"
+            echo "release_version=${release_version}"
+            echo "release_base_version=${release_base_version}"
+            echo "release_assembly_version=${release_assembly_version}"
+            echo "release_archive=${release_archive}"
+            echo "release_checksum=${release_checksum}"
+            echo "checkout_ref=${checkout_ref}"
+            echo "is_prerelease=${is_prerelease}"
+            echo "release_mode=${release_mode}"
+            echo "should_release=${should_release}"
+            echo "skip_reason=${skip_reason}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "${should_release}" != "true" ]; then
+            echo "Skipping ${release_tag}: ${skip_reason}"
+          fi
+
+  release-dotnet-unit-gate:
+    name: Release .NET unit gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: release-preflight
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run release unit gate
+        run: |
+          chmod +x eng/*.sh
+          ./eng/check-locks.sh
+          ./eng/dotnet-unit-tests.sh --configuration "$BUILD_CONFIGURATION" --locked-restore
+
+      - name: Upload unit gate results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-treehammock-unit-tests
+          path: "**/treehammock-unit-tests.trx"
+          if-no-files-found: warn
+
+  release-dotnet-integration-gate:
+    name: Release .NET integration gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: release-preflight
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run release integration gate
+        run: |
+          chmod +x eng/*.sh
+          ./eng/check-locks.sh
+          ./eng/dotnet-integration-tests.sh --configuration "$BUILD_CONFIGURATION" --locked-restore
+
+      - name: Upload integration gate results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-treehammock-integration-tests
+          path: "**/treehammock-integration-tests.trx"
+          if-no-files-found: warn
+
+  release-dotnet-sql-gate:
+    name: Release PostgreSQL SQL gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: release-preflight
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: treehammock_contract
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d treehammock_contract"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TREEHAMMOCK_RUN_DEFERRED_SQL_CONTRACTS: "true"
+      TREEHAMMOCK_DB_CONTRACT_CONNECTION: "Host=localhost;Port=5432;Database=treehammock_contract;Username=postgres;Password=postgres"
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run release SQL gate
+        run: |
+          chmod +x eng/*.sh
+          ./eng/check-locks.sh
+          ./eng/sql-contracts.sh --configuration "$BUILD_CONFIGURATION" --locked-restore
+
+      - name: Upload SQL gate results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-treehammock-sql-contracts
+          path: "**/treehammock-sql-contracts.trx"
+          if-no-files-found: warn
+
+  release-docker-direct-gate:
+    name: Release Docker direct gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: release-preflight
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Run release Docker direct gate
+        run: |
+          chmod +x eng/*.sh
+          docker version
+          docker compose version
+          ./eng/docker-http-contracts-direct.sh
+
+      - name: Tear down release Docker direct gate
+        if: always()
+        run: docker compose -f docker-compose.integration.yml -f docker-compose.api-direct.yml --profile http down --volumes --remove-orphans || true
+
+      - name: Upload Docker direct gate reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-treehammock-docker-direct-reports
+          path: "tests/http/**/reports/**"
+          if-no-files-found: warn
+
+  release-docker-proxy-gate:
+    name: Release Docker HAProxy gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: release-preflight
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Run release Docker proxy gate
+        run: |
+          chmod +x eng/*.sh
+          docker version
+          docker compose version
+          ./eng/docker-http-contracts-proxy.sh
+
+      - name: Tear down release Docker proxy gate
+        if: always()
+        run: docker compose -f docker-compose.integration.yml -f docker-compose.api-proxy.yml --profile proxy --profile http-proxy down --volumes --remove-orphans || true
+
+      - name: Upload Docker proxy gate reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-treehammock-docker-proxy-reports
+          path: "tests/http/**/reports/**"
+          if-no-files-found: warn
+
+  release-docker-system-gate:
+    name: Release Docker system gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: release-preflight
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run release Docker host-backed system gate
+        run: |
+          chmod +x eng/*.sh
+          docker version
+          docker compose version
+          ./eng/docker-host-system-stack-tests.sh
+
+      - name: Collect release Docker system logs
+        if: always()
+        run: docker compose -f docker-compose.local-system.yml --profile host-system logs --no-color > treehammock-system-stack.log || true
+
+      - name: Tear down release Docker system gate
+        if: always()
+        run: docker compose -f docker-compose.local-system.yml --profile host-system down --volumes --remove-orphans || true
+
+      - name: Upload Docker system gate reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-treehammock-docker-system-reports
+          path: |
+            **/treehammock-system-host-tests.trx
+            treehammock-system-stack.log
+            .artifacts/**
+          if-no-files-found: warn
+
+  release-package-api:
+    name: Release package API
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - release-preflight
+      - release-dotnet-unit-gate
+      - release-dotnet-integration-gate
+      - release-dotnet-sql-gate
+      - release-docker-direct-gate
+      - release-docker-proxy-gate
+      - release-docker-system-gate
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Publish versioned API archive
+        env:
+          RELEASE_VERSION: ${{ needs.release-preflight.outputs.release_version }}
+          RELEASE_ASSEMBLY_VERSION: ${{ needs.release-preflight.outputs.release_assembly_version }}
+          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
+          RELEASE_ARCHIVE: ${{ needs.release-preflight.outputs.release_archive }}
+          RELEASE_CHECKSUM: ${{ needs.release-preflight.outputs.release_checksum }}
+        run: |
+          set -euo pipefail
+          chmod +x eng/*.sh
+          ./eng/check-locks.sh
+          dotnet restore treehammock.sln --locked-mode
+          dotnet publish treehammock.csproj \
+            --configuration "$BUILD_CONFIGURATION" \
+            --no-restore \
+            -p:UseAppHost=false \
+            -p:Version="$RELEASE_VERSION" \
+            -p:PackageVersion="$RELEASE_VERSION" \
+            -p:AssemblyVersion="$RELEASE_ASSEMBLY_VERSION" \
+            -p:FileVersion="$RELEASE_ASSEMBLY_VERSION" \
+            -p:InformationalVersion="$RELEASE_TAG" \
+            --output artifacts/publish/treehammock-api
+          cp LICENSE artifacts/publish/treehammock-api/LICENSE
+          tar -C artifacts/publish -czf "artifacts/${RELEASE_ARCHIVE}" treehammock-api
+          (cd artifacts && sha256sum "${RELEASE_ARCHIVE}" > "${RELEASE_CHECKSUM}")
+
+      - name: Upload release package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-api-release-package
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  release-ghcr-image:
+    name: Optional GitHub Container Registry image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - release-preflight
+      - release-package-api
+    if: ${{ needs.release-preflight.outputs.should_release == 'true' && ((github.event_name == 'workflow_dispatch' && github.event.inputs.publish_ghcr == 'true') || (github.event_name == 'push' && vars.PUBLISH_GHCR == 'true')) }}
+    steps:
+      - name: Check out release ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-preflight.outputs.checkout_ref }}
+
+      - name: Build and publish GHCR image
+        env:
+          REGISTRY_KIND: github
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
+          IMAGE_SHA_TAG: ${{ github.sha }}
+          PUSH_LATEST_FOR_STABLE: ${{ env.PUSH_LATEST_FOR_STABLE }}
+          IMAGE_ENV_FILE: image-github.env
+        run: |
+          set -euo pipefail
+          chmod +x eng/*.sh
+          repository_lower="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          export GITHUB_CONTAINER_REGISTRY="ghcr.io"
+          export GITHUB_CONTAINER_IMAGE="ghcr.io/${repository_lower}"
+          ./eng/release-container-publish.sh
+
+      - name: Upload GHCR image metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-ghcr-image
+          path: image-github.env
+          if-no-files-found: error
+          retention-days: 90
+
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - release-preflight
+      - release-package-api
+      - release-ghcr-image
+    if: ${{ always() && needs.release-preflight.result == 'success' && needs.release-preflight.outputs.should_release == 'true' && needs.release-package-api.result == 'success' && (github.event_name == 'push' || github.event.inputs.create_release == 'true') }}
+    steps:
+      - name: Download release package artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: treehammock-api-release-package
+          path: artifacts
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release-preflight.outputs.release_tag }}
+          CHECKOUT_REF: ${{ needs.release-preflight.outputs.checkout_ref }}
+          IS_PRERELEASE: ${{ needs.release-preflight.outputs.is_prerelease }}
+          RELEASE_MODE: ${{ needs.release-preflight.outputs.release_mode }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/* --clobber --repo "$GH_REPO"
+            exit 0
+          fi
+
+          release_args=(release create "$RELEASE_TAG" artifacts/* --title "Tree Hammock ${RELEASE_TAG}" --generate-notes --repo "$GH_REPO")
+          if [ "$RELEASE_MODE" != "tag" ]; then
+            release_args+=(--target "$CHECKOUT_REF")
+          fi
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            release_args+=(--prerelease --latest=false)
+          else
+            release_args+=(--latest)
+          fi
+
+          gh "${release_args[@]}"

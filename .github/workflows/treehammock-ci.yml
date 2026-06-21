@@ -1,0 +1,257 @@
+name: Treehammock CI
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Validation lane to run. Heavy lanes are manual so normal PRs stay fast.
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - unit
+          - integration
+          - sql
+          - docker-direct
+          - docker-proxy
+          - docker-system
+
+permissions:
+  contents: read
+
+concurrency:
+  group: treehammock-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+  BUILD_CONFIGURATION: Release
+
+jobs:
+  dotnet-unit-tests:
+    name: .NET unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.lane == 'all' || github.event.inputs.lane == 'unit' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run unit lane
+        run: |
+          chmod +x eng/*.sh
+          ./eng/check-locks.sh
+          ./eng/dotnet-unit-tests.sh --configuration "$BUILD_CONFIGURATION" --locked-restore
+
+      - name: Upload unit test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-unit-tests
+          path: "**/treehammock-unit-tests.trx"
+          if-no-files-found: warn
+
+  dotnet-integration-tests:
+    name: .NET in-process integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.lane == 'all' || github.event.inputs.lane == 'integration' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run integration lane
+        run: |
+          chmod +x eng/*.sh
+          ./eng/check-locks.sh
+          ./eng/dotnet-integration-tests.sh --configuration "$BUILD_CONFIGURATION" --locked-restore
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-integration-tests
+          path: "**/treehammock-integration-tests.trx"
+          if-no-files-found: warn
+
+  dotnet-sql-contracts:
+    name: PostgreSQL SQL contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == 'all' || github.event.inputs.lane == 'sql') }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: treehammock_contract
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d treehammock_contract"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TREEHAMMOCK_RUN_DEFERRED_SQL_CONTRACTS: "true"
+      TREEHAMMOCK_DB_CONTRACT_CONNECTION: "Host=localhost;Port=5432;Database=treehammock_contract;Username=postgres;Password=postgres"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run SQL contract lane
+        run: |
+          chmod +x eng/*.sh
+          ./eng/check-locks.sh
+          ./eng/sql-contracts.sh --configuration "$BUILD_CONFIGURATION" --locked-restore
+
+      - name: Upload SQL contract test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-sql-contracts
+          path: "**/treehammock-sql-contracts.trx"
+          if-no-files-found: warn
+
+  docker-direct-integration:
+    name: Docker direct HTTP integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == 'all' || github.event.inputs.lane == 'docker-direct') }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run Docker direct lane
+        run: |
+          chmod +x eng/*.sh
+          docker version
+          docker compose version
+          ./eng/docker-http-contracts-direct.sh
+
+      - name: Tear down Docker direct lane
+        if: always()
+        run: docker compose -f docker-compose.integration.yml -f docker-compose.api-direct.yml --profile http down --volumes --remove-orphans || true
+
+      - name: Upload Docker direct reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-docker-direct-reports
+          path: "tests/http/**/reports/**"
+          if-no-files-found: warn
+
+  docker-proxy-integration:
+    name: Docker HAProxy HTTP integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == 'all' || github.event.inputs.lane == 'docker-proxy') }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run Docker proxy lane
+        run: |
+          chmod +x eng/*.sh
+          docker version
+          docker compose version
+          ./eng/docker-http-contracts-proxy.sh
+
+      - name: Tear down Docker proxy lane
+        if: always()
+        run: docker compose -f docker-compose.integration.yml -f docker-compose.api-proxy.yml --profile proxy --profile http-proxy down --volumes --remove-orphans || true
+
+      - name: Upload Docker proxy reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-docker-proxy-reports
+          path: "tests/http/**/reports/**"
+          if-no-files-found: warn
+
+  docker-system-stack:
+    name: Docker system stack tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == 'all' || github.event.inputs.lane == 'docker-system') }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+          cache: true
+          cache-dependency-path: |
+            packages.lock.json
+            **/packages.lock.json
+
+      - name: Run Docker host-backed system stack lane
+        run: |
+          chmod +x eng/*.sh
+          docker version
+          docker compose version
+          ./eng/docker-host-system-stack-tests.sh
+
+      - name: Collect Docker system logs
+        if: always()
+        run: docker compose -f docker-compose.local-system.yml --profile host-system logs --no-color > treehammock-system-stack.log || true
+
+      - name: Tear down Docker system stack lane
+        if: always()
+        run: docker compose -f docker-compose.local-system.yml --profile host-system down --volumes --remove-orphans || true
+
+      - name: Upload Docker system reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: treehammock-docker-system-reports
+          path: |
+            **/treehammock-system-host-tests.trx
+            treehammock-system-stack.log
+            .artifacts/**
+          if-no-files-found: warn
